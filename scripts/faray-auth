@@ -1,0 +1,212 @@
+#!/usr/bin/env python3
+"""
+faray-auth — X/Twitter OAuth helper for campaign sites.
+
+Commands:
+  status              Check if cookies are valid
+  oauth <url>         Open campaign URL, click X OAuth, authorize, return result
+  sync-cookies        Refresh x-cookies.json from live browser session
+
+Cookies: ~/.agent/credentials/x-cookies.json
+"""
+
+import sys
+import os
+import json
+import time
+from playwright.sync_api import sync_playwright
+
+COOKIE_PATH = os.path.expanduser("~/.agent/credentials/x-cookies.json")
+
+
+def load_cookies():
+    data = json.load(open(COOKIE_PATH))
+    if isinstance(data, dict) and "cookies" in data:
+        raw = data["cookies"]
+    elif isinstance(data, list):
+        raw = {c["name"]: c["value"] for c in data}
+    else:
+        raw = data
+    return [{"name": k, "value": v, "domain": ".x.com", "path": "/"} for k, v in raw.items()]
+
+
+def make_browser():
+    p = sync_playwright().start()
+    browser = p.chromium.launch(headless=True)
+    ctx = browser.new_context()
+    ctx.add_cookies(load_cookies())
+    page = ctx.new_page()
+    return p, browser, ctx, page
+
+
+def cmd_status(_args):
+    """Check if cookies are valid."""
+    if not os.path.exists(COOKIE_PATH):
+        return {"logged_in": False, "reason": "no cookies file"}
+
+    p, browser, ctx, page = make_browser()
+    try:
+        page.goto("https://x.com/home", timeout=30000)
+        time.sleep(5)
+        logged_in = bool(page.query_selector('[data-testid="AppTabBar_Profile_Link"]'))
+        url = page.url
+        return {"logged_in": logged_in, "url": url}
+    finally:
+        ctx.close()
+        p.stop()
+
+
+def cmd_oauth(args):
+    """Open campaign URL, find and click X OAuth button, authorize."""
+    if not args:
+        return {"error": "usage", "detail": "faray-auth oauth <campaign_url>"}
+
+    url = args[0]
+    p, browser, ctx, page = make_browser()
+    try:
+        print(f"Opening: {url}", file=sys.stderr)
+        page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        time.sleep(3)
+
+        # Find OAuth/sign-in buttons
+        buttons = page.query_selector_all("button")
+        oauth_btn = None
+        for btn in buttons:
+            text = (btn.inner_text() or "").lower()
+            if any(kw in text for kw in ["sign in with x", "sign in with twitter", "connect with x", "login with x", "continue with x"]):
+                oauth_btn = btn
+                break
+
+        if not oauth_btn:
+            # Try links
+            links = page.query_selector_all("a")
+            for link in links:
+                text = (link.inner_text() or "").lower()
+                href = link.get_attribute("href") or ""
+                if any(kw in text for kw in ["sign in", "login", "connect"]) and "x.com" in href:
+                    oauth_btn = link
+                    break
+
+        if not oauth_btn:
+            return {
+                "error": "no_oauth_button",
+                "page_url": page.url,
+                "page_title": page.title(),
+                "buttons_found": [(b.inner_text() or "")[:50] for b in buttons[:10]],
+            }
+
+        # Click OAuth button
+        btn_text = oauth_btn.inner_text()
+        print(f"Clicking: {btn_text}", file=sys.stderr)
+
+        with page.expect_popup() as popup_info:
+            try:
+                oauth_btn.click(force=True, timeout=5000)
+            except:
+                # Might redirect instead of popup
+                pass
+
+        try:
+            popup = popup_info.value
+            popup.wait_for_load_state("domcontentloaded", timeout=15000)
+            time.sleep(3)
+            current_url = popup.url
+            print(f"Popup URL: {current_url}", file=sys.stderr)
+
+            # Check if we need to authorize
+            if "x.com" in current_url and "oauth" in current_url.lower():
+                auth_btn = popup.query_selector('[data-testid="OAuth_Consent_Button"]')
+                if auth_btn:
+                    print("Clicking authorize...", file=sys.stderr)
+                    auth_btn.click(timeout=5000)
+                    time.sleep(5)
+
+            popup.close()
+        except:
+            # No popup — redirect flow
+            time.sleep(5)
+            current_url = page.url
+            print(f"Redirect URL: {current_url}", file=sys.stderr)
+
+            if "x.com" in current_url and "oauth" in current_url.lower():
+                auth_btn = page.query_selector('[data-testid="OAuth_Consent_Button"]')
+                if auth_btn:
+                    print("Clicking authorize...", file=sys.stderr)
+                    auth_btn.click(timeout=5000)
+                    time.sleep(5)
+
+        # Now should be back on campaign site
+        time.sleep(3)
+        result = {
+            "ok": True,
+            "final_url": page.url,
+            "page_title": page.title(),
+            "body_preview": (page.inner_text("body") or "")[:500],
+        }
+
+        # Export fresh cookies
+        cookies = ctx.cookies()
+        fresh = {}
+        for c in cookies:
+            if c["name"] in ("auth_token", "ct0", "twid", "guest_id", "session_id"):
+                fresh[c["name"]] = c["value"]
+        if fresh:
+            with open(COOKIE_PATH, "w") as f:
+                json.dump(fresh, f, indent=2)
+            result["cookies_refreshed"] = list(fresh.keys())
+
+        return result
+
+    finally:
+        ctx.close()
+        p.stop()
+
+
+def cmd_sync_cookies(_args):
+    """Refresh x-cookies.json from live browser session."""
+    p, browser, ctx, page = make_browser()
+    try:
+        page.goto("https://x.com/home", timeout=30000)
+        time.sleep(5)
+
+        if not bool(page.query_selector('[data-testid="AppTabBar_Profile_Link"]')):
+            return {"error": "not_logged_in"}
+
+        cookies = ctx.cookies()
+        fresh = {}
+        for c in cookies:
+            if c["name"] in ("auth_token", "ct0", "twid", "guest_id", "session_id"):
+                fresh[c["name"]] = c["value"]
+
+        with open(COOKIE_PATH, "w") as f:
+            json.dump(fresh, f, indent=2)
+
+        return {"ok": True, "cookies": list(fresh.keys()), "count": len(fresh)}
+    finally:
+        ctx.close()
+        p.stop()
+
+
+COMMANDS = {
+    "status": cmd_status,
+    "oauth": cmd_oauth,
+    "sync-cookies": cmd_sync_cookies,
+}
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help", "help"):
+        print(__doc__)
+        sys.exit(0)
+
+    cmd = sys.argv[1]
+    if cmd not in COMMANDS:
+        print(json.dumps({"error": f"unknown command: {cmd}", "commands": list(COMMANDS.keys())}))
+        sys.exit(1)
+
+    result = COMMANDS[cmd](sys.argv[2:])
+    print(json.dumps(result, indent=2, default=str))
+
+
+if __name__ == "__main__":
+    main()

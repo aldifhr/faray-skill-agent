@@ -1,6 +1,6 @@
 # faray-skill-agent
 
-Automation toolkit — Twitter/X + Airdrop tracking.
+Automation toolkit — Twitter/X + Airdrop tracking + OAuth helper.
 
 ## Commands
 
@@ -32,6 +32,14 @@ Automation toolkit — Twitter/X + Airdrop tracking.
 
 **Options:** `--chain`, `--wallet`, `--deadline`, `--requirements`, `--status`, `--url`, `--notes`
 
+### faray-auth (OAuth Helper)
+
+| Command | Description |
+|---------|-------------|
+| `faray-auth status` | Check if cookies are valid |
+| `faray-auth oauth <url>` | Open campaign URL, handle X OAuth flow |
+| `faray-auth sync-cookies` | Refresh cookies from live session |
+
 All output JSON.
 
 ## Setup
@@ -50,7 +58,8 @@ Minimum cookies: `auth_token` + `ct0`.
 ```bash
 cp scripts/faray-twitter-tweet /usr/local/bin/
 cp scripts/faray-airdrop /usr/local/bin/
-chmod +x /usr/local/bin/faray-twitter-tweet /usr/local/bin/faray-airdrop
+cp scripts/faray-auth /usr/local/bin/
+chmod +x /usr/local/bin/faray-*
 ```
 
 ## License

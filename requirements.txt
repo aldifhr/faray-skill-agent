@@ -1,1 +1,5 @@
+# Core (for faras-twitter-tweet and faras-scrape)
 playwright>=1.40.0
+
+# Optional (for faras-research, not needed for other tools)
+# requests  # not needed — uses urllib

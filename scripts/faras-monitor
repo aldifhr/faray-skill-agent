@@ -1,0 +1,343 @@
+#!/usr/bin/env python3
+"""VPS/system monitor — disk, memory, CPU, docker, processes.
+
+Usage:
+  faras-monitor overview
+  faras-monitor disk [--warn <percent>]
+  faras-monitor memory
+  faras-monitor cpu [--top N]
+  faras-monitor docker
+  faras-monitor processes [--top N]
+  faras-monitor network
+  faras-monitor services
+  faras-monitor ports
+
+Examples:
+  faras-monitor overview
+  faras-monitor disk --warn 80
+  faras-monitor cpu --top 10
+  faras-monitor docker
+  faras-monitor ports
+"""
+import sys, json, subprocess, os, time
+
+
+def run(cmd, timeout=10):
+    try:
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+        return r.stdout.strip()
+    except:
+        return ""
+
+
+def cmd_overview(args=None):
+    import platform
+    uptime = run("uptime -p")
+    load = run("cat /proc/loadavg").split()[:3]
+
+    # Disk
+    disk_lines = run("df -h --output=source,size,used,avail,pcent,target -x tmpfs -x devtmpfs -x squashfs").split("\n")
+    disks = []
+    for line in disk_lines[1:]:
+        parts = line.split()
+        if len(parts) >= 6:
+            disks.append({"device": parts[0], "size": parts[1], "used": parts[2],
+                          "avail": parts[3], "use_percent": parts[4], "mount": parts[5]})
+
+    # Memory
+    mem = run("free -b | grep Mem").split()
+    mem_total = int(mem[1]) if len(mem) > 1 else 0
+    mem_used = int(mem[2]) if len(mem) > 2 else 0
+    mem_free = int(mem[3]) if len(mem) > 3 else 0
+    mem_available = int(mem[6]) if len(mem) > 6 else 0
+
+    # Swap
+    swap = run("free -b | grep Swap").split()
+    swap_total = int(swap[1]) if len(swap) > 1 else 0
+    swap_used = int(swap[2]) if len(swap) > 2 else 0
+
+    # CPU
+    cpu_model = run("cat /proc/cpuinfo | grep 'model name' | head -1 | cut -d: -f2").strip()
+    cpu_cores = run("nproc")
+
+    # Docker
+    docker_ps = run("docker ps --format '{{.Names}}\t{{.Status}}\t{{.Ports}}' 2>/dev/null")
+    containers = []
+    for line in docker_ps.split("\n"):
+        if line.strip():
+            parts = line.split("\t")
+            containers.append({"name": parts[0], "status": parts[1] if len(parts) > 1 else "",
+                               "ports": parts[2] if len(parts) > 2 else ""})
+
+    return {
+        "hostname": platform.node(),
+        "os": f"{platform.system()} {platform.release()}",
+        "uptime": uptime,
+        "load_avg": load,
+        "cpu": {"model": cpu_model, "cores": int(cpu_cores) if cpu_cores else 0},
+        "memory": {
+            "total_gb": round(mem_total / 1e9, 2),
+            "used_gb": round(mem_used / 1e9, 2),
+            "available_gb": round(mem_available / 1e9, 2),
+            "use_percent": round(mem_used / mem_total * 100, 1) if mem_total else 0,
+        },
+        "swap": {
+            "total_gb": round(swap_total / 1e9, 2),
+            "used_gb": round(swap_used / 1e9, 2),
+        },
+        "disks": disks,
+        "docker_containers": containers,
+    }
+
+
+def cmd_disk(args=[]):
+    warn = 80
+    if "--warn" in args:
+        idx = args.index("--warn")
+        warn = int(args[idx + 1])
+
+    disk_lines = run("df -h --output=source,size,used,avail,pcent,target -x tmpfs -x devtmpfs -x squashfs").split("\n")
+    disks = []
+    warnings = []
+    for line in disk_lines[1:]:
+        parts = line.split()
+        if len(parts) >= 6:
+            pct = int(parts[4].replace("%", ""))
+            disk = {"device": parts[0], "size": parts[1], "used": parts[2],
+                    "avail": parts[3], "use_percent": pct, "mount": parts[5]}
+            disks.append(disk)
+            if pct >= warn:
+                warnings.append(f"⚠️ {parts[5]} at {pct}%")
+
+    # Inodes
+    inode_lines = run("df -i --output=source,itotal,iused,iavail,ipcent,target -x tmpfs -x devtmpfs -x squashfs").split("\n")
+    inodes = []
+    for line in inode_lines[1:]:
+        parts = line.split()
+        if len(parts) >= 6:
+            inodes.append({"device": parts[0], "total": parts[1], "used": parts[2],
+                           "avail": parts[3], "use_percent": parts[4], "mount": parts[5]})
+
+    return {"disks": disks, "inodes": inodes, "warnings": warnings}
+
+
+def cmd_memory(args=None):
+    mem = run("free -b | grep Mem").split()
+    swap = run("free -b | grep Swap").split()
+    mem_total = int(mem[1]) if len(mem) > 1 else 0
+    mem_used = int(mem[2]) if len(mem) > 2 else 0
+    mem_free = int(mem[3]) if len(mem) > 3 else 0
+    mem_available = int(mem[6]) if len(mem) > 6 else 0
+    buffers = int(mem[5]) if len(mem) > 5 else 0
+    cached = int(mem[6]) if len(mem) > 6 else 0
+
+    swap_total = int(swap[1]) if len(swap) > 1 else 0
+    swap_used = int(swap[2]) if len(swap) > 2 else 0
+
+    # Top memory consumers
+    top_mem = run("ps aux --sort=-%mem | head -11 | tail -10")
+    processes = []
+    for line in top_mem.split("\n"):
+        parts = line.split(None, 10)
+        if len(parts) >= 11:
+            processes.append({
+                "user": parts[0], "pid": parts[1],
+                "cpu": float(parts[2]), "mem": float(parts[3]),
+                "vsz_mb": round(int(parts[4]) / 1024, 1),
+                "rss_mb": round(int(parts[5]) / 1024, 1),
+                "command": parts[10][:100],
+            })
+
+    return {
+        "memory": {
+            "total_gb": round(mem_total / 1e9, 2),
+            "used_gb": round(mem_used / 1e9, 2),
+            "free_gb": round(mem_free / 1e9, 2),
+            "available_gb": round(mem_available / 1e9, 2),
+            "buffers_gb": round(buffers / 1e9, 2),
+            "use_percent": round(mem_used / mem_total * 100, 1) if mem_total else 0,
+        },
+        "swap": {
+            "total_gb": round(swap_total / 1e9, 2),
+            "used_gb": round(swap_used / 1e9, 2),
+        },
+        "top_processes": processes,
+    }
+
+
+def cmd_cpu(args=[]):
+    top_n = 10
+    if "--top" in args:
+        idx = args.index("--top")
+        top_n = int(args[idx + 1])
+
+    # CPU usage snapshot
+    usage1 = run("cat /proc/stat | head -1").split()
+    time.sleep(0.5)
+    usage2 = run("cat /proc/stat | head -1").split()
+
+    if len(usage1) >= 5 and len(usage2) >= 5:
+        d_idle = int(usage2[4]) - int(usage1[4])
+        d_total = sum(int(x) for x in usage2[1:]) - sum(int(x) for x in usage1[1:])
+        cpu_percent = round((1 - d_idle / d_total) * 100, 1) if d_total else 0
+    else:
+        cpu_percent = 0
+
+    # Top CPU processes
+    top_cpu = run(f"ps aux --sort=-%cpu | head -{top_n + 1} | tail -{top_n}")
+    processes = []
+    for line in top_cpu.split("\n"):
+        parts = line.split(None, 10)
+        if len(parts) >= 11:
+            processes.append({
+                "user": parts[0], "pid": parts[1],
+                "cpu": float(parts[2]), "mem": float(parts[3]),
+                "command": parts[10][:100],
+            })
+
+    # Load average
+    load = run("cat /proc/loadavg").split()[:3]
+
+    return {
+        "cpu_percent": cpu_percent,
+        "load_avg": {"1m": load[0], "5m": load[1], "15m": load[2]},
+        "top_processes": processes,
+    }
+
+
+def cmd_docker(args=None):
+    # All containers
+    all_containers = run("docker ps -a --format '{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}' 2>/dev/null")
+    containers = []
+    for line in all_containers.split("\n"):
+        if line.strip():
+            parts = line.split("\t")
+            containers.append({
+                "id": parts[0] if len(parts) > 0 else "",
+                "name": parts[1] if len(parts) > 1 else "",
+                "image": parts[2] if len(parts) > 2 else "",
+                "status": parts[3] if len(parts) > 3 else "",
+                "ports": parts[4] if len(parts) > 4 else "",
+            })
+
+    # Images
+    images = run("docker images --format '{{.Repository}}\t{{.Tag}}\t{{.Size}}\t{{.CreatedSince}}' 2>/dev/null")
+    image_list = []
+    for line in images.split("\n"):
+        if line.strip():
+            parts = line.split("\t")
+            image_list.append({
+                "repo": parts[0] if len(parts) > 0 else "",
+                "tag": parts[1] if len(parts) > 1 else "",
+                "size": parts[2] if len(parts) > 2 else "",
+                "created": parts[3] if len(parts) > 3 else "",
+            })
+
+    # Docker disk usage
+    disk_usage = run("docker system df 2>/dev/null")
+
+    return {
+        "containers": containers,
+        "images": image_list[:20],
+        "disk_usage": disk_usage,
+    }
+
+
+def cmd_processes(args=[]):
+    top_n = 15
+    if "--top" in args:
+        idx = args.index("--top")
+        top_n = int(args[idx + 1])
+
+    total = run("ps aux | wc -l")
+    top = run(f"ps aux --sort=-%mem | head -{top_n + 1} | tail -{top_n}")
+    processes = []
+    for line in top.split("\n"):
+        parts = line.split(None, 10)
+        if len(parts) >= 11:
+            processes.append({
+                "user": parts[0], "pid": parts[1],
+                "cpu": float(parts[2]), "mem": float(parts[3]),
+                "rss_mb": round(int(parts[5]) / 1024, 1),
+                "command": parts[10][:120],
+            })
+
+    return {"total_processes": int(total) - 1 if total else 0, "top_processes": processes}
+
+
+def cmd_network(args=None):
+    # Active connections
+    conns = run("ss -tunap | head -30")
+    # Public IP
+    public_ip = run("curl -s --max-time 5 ifconfig.me")
+    # DNS
+    dns = run("cat /etc/resolv.conf | grep nameserver | head -3")
+
+    return {
+        "public_ip": public_ip,
+        "dns": dns,
+        "connections": conns,
+    }
+
+
+def cmd_services(args=None):
+    # Systemd services that are active
+    services = run("systemctl list-units --type=service --state=running --no-pager --no-legend | head -20")
+    result = []
+    for line in services.split("\n"):
+        parts = line.split(None, 4)
+        if len(parts) >= 4:
+            result.append({
+                "name": parts[0],
+                "load": parts[1],
+                "active": parts[2],
+                "sub": parts[3],
+                "description": parts[4] if len(parts) > 4 else "",
+            })
+    return {"active_services": result}
+
+
+def cmd_ports(args=None):
+    listening = run("ss -tlnp | tail -n +2")
+    ports = []
+    for line in listening.split("\n"):
+        parts = line.split()
+        if len(parts) >= 5:
+            addr = parts[3]
+            process = parts[-1] if "=" in parts[-1] else ""
+            ports.append({"local_address": addr, "process": process})
+    return {"listening_ports": ports}
+
+
+def main():
+    if len(sys.argv) < 2:
+        print(json.dumps({"error": "usage", "commands": [
+            "overview", "disk", "memory", "cpu", "docker", "processes", "network", "services", "ports"
+        ]}))
+        sys.exit(1)
+
+    cmd = sys.argv[1]
+    args = sys.argv[2:]
+
+    commands = {
+        "overview": cmd_overview,
+        "disk": cmd_disk,
+        "memory": cmd_memory,
+        "cpu": cmd_cpu,
+        "docker": cmd_docker,
+        "processes": cmd_processes,
+        "network": cmd_network,
+        "services": cmd_services,
+        "ports": cmd_ports,
+    }
+
+    if cmd not in commands:
+        print(json.dumps({"error": f"Unknown command: {cmd}"}))
+        sys.exit(1)
+
+    result = commands[cmd](args)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    main()

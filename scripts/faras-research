@@ -1,0 +1,227 @@
+#!/usr/bin/env python3
+"""Web research tool — Exa API search + URL extraction.
+
+Usage:
+  faras-research search <query> [--results N] [--type web|news|company]
+  faras-research extract <url> [--chars N]
+  faras-research extract-multi <url1> <url2> ... [--chars N]
+  faras-research find-similar <url> [--results N]
+  faras-research research <query> [--results N] [--depth quick|full]
+
+Examples:
+  faras-research search "best airdrop solana 2026"
+  faras-research extract "https://example.com/article" --chars 5000
+  faras-research find-similar "https://example.com/tool" --results 5
+  faras-research research "playwright browser automation" --depth full
+"""
+import sys, json, urllib.request, urllib.error, os
+
+EXA_API_KEY = os.environ.get("EXA_API_KEY", "")
+EXA_BASE = "https://api.exa.ai"
+
+
+def exa_request(path, body):
+    """Make Exa API request."""
+    if not EXA_API_KEY:
+        return {"error": "EXA_API_KEY not set. Export it: export EXA_API_KEY=your_key"}
+
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        f"{EXA_BASE}{path}",
+        data=data,
+        headers={
+            "x-api-key": EXA_API_KEY,
+            "Content-Type": "application/json",
+        },
+        method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode() if e.readable() else ""
+        return {"error": f"HTTP {e.code}: {body[:200]}"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def cmd_search(args):
+    if not args:
+        return {"error": "Usage: faras-research search <query> [--results N] [--type web|news|company]"}
+    query = args[0]
+    num_results = 10
+    category = None
+
+    if "--results" in args:
+        idx = args.index("--results")
+        num_results = int(args[idx + 1])
+    if "--type" in args:
+        idx = args.index("--type")
+        category = args[idx + 1]
+
+    body = {"query": query, "numResults": min(num_results, 30),
+            "type": "auto",
+            "contents": {"text": {"maxCharacters": 3000}}}
+    if category:
+        body["category"] = category
+
+    result = exa_request("/search", body)
+    if "error" in result:
+        return result
+
+    results = []
+    for r in result.get("results", []):
+        results.append({
+            "title": r.get("title", ""),
+            "url": r.get("url", ""),
+            "score": r.get("score", 0),
+            "text": r.get("text", "")[:1000],
+            "published_date": r.get("publishedDate", ""),
+            "author": r.get("author", ""),
+        })
+
+    return {"query": query, "count": len(results), "results": results}
+
+
+def cmd_extract(args):
+    if not args:
+        return {"error": "Usage: faras-research extract <url> [--chars N]"}
+    url = args[0]
+    max_chars = 5000
+    if "--chars" in args:
+        idx = args.index("--chars")
+        max_chars = int(args[idx + 1])
+
+    body = {"urls": [url], "contents": {"text": {"maxCharacters": max_chars}}}
+    result = exa_request("/contents", body)
+    if "error" in result:
+        return result
+
+    contents = result.get("results", [])
+    if contents:
+        c = contents[0]
+        return {"url": c.get("url", url), "title": c.get("title", ""),
+                "text": c.get("text", ""), "author": c.get("author", ""),
+                "published_date": c.get("publishedDate", "")}
+    return {"error": "No content extracted"}
+
+
+def cmd_extract_multi(args):
+    urls = [a for a in args if a.startswith("http")]
+    max_chars = 3000
+    if "--chars" in args:
+        idx = args.index("--chars")
+        max_chars = int(args[idx + 1])
+
+    if not urls:
+        return {"error": "Usage: faras-research extract-multi <url1> <url2> ... [--chars N]"}
+
+    body = {"urls": urls[:10], "contents": {"text": {"maxCharacters": max_chars}}}
+    result = exa_request("/contents", body)
+    if "error" in result:
+        return result
+
+    contents = []
+    for c in result.get("results", []):
+        contents.append({
+            "url": c.get("url", ""),
+            "title": c.get("title", ""),
+            "text": c.get("text", "")[:2000],
+        })
+    return {"count": len(contents), "contents": contents}
+
+
+def cmd_find_similar(args):
+    if not args:
+        return {"error": "Usage: faras-research find-similar <url> [--results N]"}
+    url = args[0]
+    num_results = 10
+    if "--results" in args:
+        idx = args.index("--results")
+        num_results = int(args[idx + 1])
+
+    body = {"url": url, "numResults": min(num_results, 30),
+            "contents": {"text": {"maxCharacters": 2000}}}
+    result = exa_request("/findSimilar", body)
+    if "error" in result:
+        return result
+
+    results = []
+    for r in result.get("results", []):
+        results.append({
+            "title": r.get("title", ""),
+            "url": r.get("url", ""),
+            "score": r.get("score", 0),
+            "text": r.get("text", "")[:500],
+        })
+    return {"source": url, "count": len(results), "results": results}
+
+
+def cmd_research(args):
+    """Deep research: search + extract top results."""
+    if not args:
+        return {"error": "Usage: faras-research research <query> [--results N] [--depth quick|full]"}
+    query = args[0]
+    num_results = 5
+    depth = "quick"
+    if "--results" in args:
+        idx = args.index("--results")
+        num_results = int(args[idx + 1])
+    if "--depth" in args:
+        idx = args.index("--depth")
+        depth = args[idx + 1]
+
+    max_chars = 3000 if depth == "quick" else 8000
+    top_n = min(num_results, 5) if depth == "quick" else min(num_results, 10)
+
+    # Step 1: Search
+    search_body = {"query": query, "numResults": top_n, "type": "auto",
+                   "contents": {"text": {"maxCharacters": 2000}}}
+    search_result = exa_request("/search", search_body)
+    if "error" in search_result:
+        return search_result
+
+    results = search_result.get("results", [])
+
+    # Step 2: Extract full content from top results
+    urls = [r.get("url") for r in results if r.get("url")][:top_n]
+    if urls:
+        extract_body = {"urls": urls, "contents": {"text": {"maxCharacters": max_chars}}}
+        extract_result = exa_request("/contents", extract_body)
+        if "error" not in extract_result:
+            # Merge extracted text with search results
+            extracted = {c.get("url"): c for c in extract_result.get("results", [])}
+            for r in results:
+                url = r.get("url")
+                if url in extracted:
+                    r["full_text"] = extracted[url].get("text", "")[:max_chars]
+
+    return {"query": query, "depth": depth, "count": len(results), "results": results}
+
+
+def main():
+    if len(sys.argv) < 2:
+        print(json.dumps({"error": "usage", "commands": ["search", "extract", "extract-multi", "find-similar", "research"]}))
+        sys.exit(1)
+
+    cmd = sys.argv[1]
+    args = sys.argv[2:]
+
+    commands = {
+        "search": cmd_search,
+        "extract": cmd_extract,
+        "extract-multi": cmd_extract_multi,
+        "find-similar": cmd_find_similar,
+        "research": cmd_research,
+    }
+
+    if cmd not in commands:
+        print(json.dumps({"error": f"Unknown command: {cmd}"}))
+        sys.exit(1)
+
+    result = commands[cmd](args)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    main()

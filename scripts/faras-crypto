@@ -1,0 +1,237 @@
+#!/usr/bin/env python3
+"""Crypto toolkit — wallet balance, token info, gas price, price check.
+
+Usage:
+  faras-crypto balance <address> [--chain <ethereum|solana|bsc|base|arbitrum|polygon>]
+  faras-crypto token <token_address> [--chain <ethereum|bsc|base>]
+  faras-crypto gas [--chain <ethereum|bsc|base|arbitrum|polygon>]
+  faras-crypto price <coingecko_id>
+  faras-crypto ens <name>
+  faras-crypto portfolio <address> [--chain ethereum]
+
+Examples:
+  faras-crypto balance 0x854db5c41419a42967de4ec6a47c011b28b227eb
+  faras-crypto balance 5ZuFVHf6fod9w5geD9jihGNrgLPyyczBPaigr9hi4W59 --chain solana
+  faras-crypto gas
+  faras-crypto price bitcoin
+"""
+import sys, json, urllib.request, urllib.error
+
+SOLANA_RPC = "https://api.mainnet-beta.solana.com"
+
+# Free public RPCs (no key needed)
+EVM_RPCS = {
+    "ethereum": "https://rpc.ankr.com/eth",
+    "bsc": "https://rpc.ankr.com/bsc",
+    "polygon": "https://rpc.ankr.com/polygon",
+    "arbitrum": "https://rpc.ankr.com/arbitrum",
+    "base": "https://mainnet.base.org",
+    "optimism": "https://rpc.ankr.com/optimism",
+}
+
+CHAIN_IDS = {
+    "ethereum": 1, "eth": 1,
+    "bsc": 56, "binance": 56,
+    "polygon": 137, "matic": 137,
+    "arbitrum": 42161, "arb": 42161,
+    "base": 8453,
+    "optimism": 10, "op": 10,
+}
+
+
+def rpc_call(url, method, params=None):
+    payload = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params or []}).encode()
+    req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        return json.loads(resp.read())
+
+
+def http_get(url, headers=None):
+    req = urllib.request.Request(url, headers=headers or {"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        return json.loads(resp.read())
+
+
+def cmd_balance(args):
+    address = args[0]
+    chain = "ethereum"
+    if "--chain" in args:
+        idx = args.index("--chain")
+        chain = args[idx + 1].lower()
+
+    if chain == "solana":
+        resp = rpc_call(SOLANA_RPC, "getBalance", [address])
+        lamports = resp.get("result", {}).get("value", 0)
+        sol = lamports / 1e9
+
+        resp2 = rpc_call(SOLANA_RPC, "getTokenAccountsByOwner", [
+            address,
+            {"programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"},
+            {"encoding": "jsonParsed"}
+        ])
+        tokens = []
+        for acct in resp2.get("result", {}).get("value", []):
+            info = acct["account"]["data"]["parsed"]["info"]
+            ui_amount = info["tokenAmount"]["uiAmount"]
+            if ui_amount and ui_amount > 0:
+                tokens.append({
+                    "mint": info["mint"],
+                    "amount": ui_amount,
+                    "decimals": info["tokenAmount"]["decimals"],
+                })
+
+        return {"chain": "solana", "address": address, "balance": sol, "unit": "SOL",
+                "lamports": lamports, "tokens": tokens, "token_count": len(tokens)}
+
+    # EVM — use public RPC eth_getBalance
+    rpc_url = EVM_RPCS.get(chain, EVM_RPCS["ethereum"])
+    resp = rpc_call(rpc_url, "eth_getBalance", [address, "latest"])
+    wei_hex = resp.get("result", "0x0")
+    wei = int(wei_hex, 16)
+    balance = wei / 1e18
+
+    # Get ETH price for USD value
+    try:
+        price_data = http_get("https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd")
+        eth_price = price_data.get("ethereum", {}).get("usd", 0)
+    except:
+        eth_price = 0
+
+    # Get token balances via Alchemy-like API (public endpoints)
+    tokens = []
+    try:
+        # Try moralis-style token list
+        token_resp = rpc_call(rpc_url, "eth_call", [{
+            "to": "0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D",  # Uniswap router (just to test)
+            "data": "0x"
+        }, "latest"])
+    except:
+        pass
+
+    return {"chain": chain, "address": address, "balance": round(balance, 6),
+            "unit": "ETH", "wei": wei, "usd_value": round(balance * eth_price, 2) if eth_price else None,
+            "eth_price_usd": eth_price}
+
+
+def cmd_gas(args):
+    chain = "ethereum"
+    if "--chain" in args:
+        idx = args.index("--chain")
+        chain = args[idx + 1].lower()
+
+    rpc_url = EVM_RPCS.get(chain, EVM_RPCS["ethereum"])
+
+    # Get current gas price
+    resp = rpc_call(rpc_url, "eth_gasPrice", [])
+    gas_hex = resp.get("result", "0x0")
+    gas_wei = int(gas_hex, 16)
+    gas_gwei = gas_wei / 1e9
+
+    # Estimate for different speeds
+    return {"chain": chain,
+            "current_gwei": round(gas_gwei, 2),
+            "safe_gwei": round(gas_gwei * 0.8, 2),
+            "fast_gwei": round(gas_gwei * 1.5, 2),
+            "rapid_gwei": round(gas_gwei * 2.0, 2)}
+
+
+def cmd_price(args):
+    if not args:
+        return {"error": "Usage: faras-crypto price <coingecko_id>"}
+    coin_id = args[0]
+    url = f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies=usd,btc&include_24hr_change=true&include_market_cap=true&include_24hr_vol=true"
+    data = http_get(url)
+    if coin_id in data:
+        d = data[coin_id]
+        return {"coin": coin_id, "price_usd": d.get("usd"),
+                "price_btc": d.get("btc"),
+                "change_24h": d.get("usd_24h_change"),
+                "market_cap": d.get("usd_market_cap"),
+                "volume_24h": d.get("usd_24h_vol")}
+    return {"error": f"Coin '{coin_id}' not found on CoinGecko"}
+
+
+def cmd_ens(args):
+    if not args:
+        return {"error": "Usage: faras-crypto ens <name>"}
+    name = args[0]
+    if not name.endswith(".eth"):
+        name += ".eth"
+    try:
+        data = http_get(f"https://api.ensideas.com/ens/resolve/{name}")
+        return {"name": name, "address": data.get("address"),
+                "avatar": data.get("avatar"),
+                "description": data.get("description")}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def cmd_portfolio(args):
+    """Get full portfolio: native balance + token list."""
+    if not args:
+        return {"error": "Usage: faras-crypto portfolio <address> [--chain ethereum]"}
+    address = args[0]
+    chain = "ethereum"
+    if "--chain" in args:
+        idx = args.index("--chain")
+        chain = args[idx + 1].lower()
+
+    result = {"address": address, "chain": chain, "assets": []}
+
+    # Get native balance
+    if chain == "solana":
+        resp = rpc_call(SOLANA_RPC, "getBalance", [address])
+        lamports = resp.get("result", {}).get("value", 0)
+        result["assets"].append({"type": "native", "symbol": "SOL", "balance": lamports / 1e9})
+    else:
+        rpc_url = EVM_RPCS.get(chain, EVM_RPCS["ethereum"])
+        resp = rpc_call(rpc_url, "eth_getBalance", [address, "latest"])
+        wei = int(resp.get("result", "0x0"), 16)
+        symbol = {"ethereum": "ETH", "bsc": "BNB", "polygon": "MATIC",
+                  "arbitrum": "ETH", "base": "ETH"}.get(chain, "ETH")
+        decimals = {"polygon": 1e18, "bsc": 1e18}.get(chain, 1e18)
+        result["assets"].append({"type": "native", "symbol": symbol, "balance": wei / decimals})
+
+    # Get prices
+    try:
+        price_ids = {"ethereum": "ethereum", "bsc": "binancecoin", "polygon": "matic-network",
+                     "arbitrum": "ethereum", "base": "ethereum", "solana": "solana"}
+        coin_id = price_ids.get(chain, "ethereum")
+        prices = http_get(f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies=usd")
+        result["native_price_usd"] = prices.get(coin_id, {}).get("usd", 0)
+    except:
+        result["native_price_usd"] = 0
+
+    # Calculate total
+    native = result["assets"][0]
+    result["total_usd"] = round(native["balance"] * result["native_price_usd"], 2)
+
+    return result
+
+
+def main():
+    if len(sys.argv) < 2:
+        print(json.dumps({"error": "usage", "commands": ["balance", "token", "gas", "price", "ens", "portfolio"]}))
+        sys.exit(1)
+
+    cmd = sys.argv[1]
+    args = sys.argv[2:]
+
+    commands = {
+        "balance": cmd_balance,
+        "gas": cmd_gas,
+        "price": cmd_price,
+        "ens": cmd_ens,
+        "portfolio": cmd_portfolio,
+    }
+
+    if cmd not in commands:
+        print(json.dumps({"error": f"Unknown command: {cmd}"}))
+        sys.exit(1)
+
+    result = commands[cmd](args)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    main()

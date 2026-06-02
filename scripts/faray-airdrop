@@ -1,0 +1,359 @@
+#!/usr/bin/env python3
+"""
+faray-airdrop — Airdrop campaign tracker (SQLite + JSON output)
+
+Commands:
+  add <name> [options]     Add new campaign
+  list [status]            List campaigns (optional filter: pending/submitted/verified/expired/failed)
+  show <id>                Show campaign details
+  update <id> <field> <val> Update a field
+  delete <id>              Delete a campaign
+  stats                    Summary statistics
+  export                   Export all campaigns as JSON
+  check-deadlines          List campaigns expiring within 7 days
+
+Options for add/update:
+  --chain <ETH|SOL|BSC|BASE|ARB|OTHER>
+  --wallet <address>
+  --deadline <YYYY-MM-DD>
+  --requirements <text>
+  --status <pending|submitted|verified|expired|failed>
+  --url <campaign_url>
+  --notes <text>
+
+Examples:
+  faray-airdrop add KAIRO --chain SOL --deadline 2026-06-15 --requirements "follow,retweet" --url https://kairo.win
+  faray-airdrop list pending
+  faray-airdrop update 3 --status submitted
+  faray-airdrop stats
+"""
+
+import sys
+import os
+import json
+import sqlite3
+from datetime import datetime, timedelta
+
+DB_PATH = os.path.expanduser("~/.hermes/data/airdrops.db")
+
+VALID_STATUSES = ["pending", "submitted", "verified", "expired", "failed"]
+VALID_CHAINS = ["ETH", "SOL", "BSC", "BASE", "ARB", "POLYGON", "OTHER"]
+DEFAULT_WALLET = "0x854db5c41419a42967de4ec6a47c011b28b227eb"
+
+
+def get_db():
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS campaigns (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            chain TEXT DEFAULT 'ETH',
+            wallet TEXT,
+            deadline TEXT,
+            requirements TEXT,
+            status TEXT DEFAULT 'pending',
+            url TEXT,
+            notes TEXT,
+            created_at TEXT DEFAULT (datetime('now')),
+            updated_at TEXT DEFAULT (datetime('now'))
+        )
+    """)
+    conn.commit()
+    return conn
+
+
+def parse_args(args):
+    """Parse --key value pairs from args list."""
+    result = {}
+    i = 0
+    while i < len(args):
+        if args[i].startswith("--") and i + 1 < len(args):
+            key = args[i][2:].replace("-", "_")
+            result[key] = args[i + 1]
+            i += 2
+        elif args[i].startswith("--") and i + 1 >= len(args):
+            break
+        else:
+            i += 1
+    return result
+
+
+def cmd_add(args):
+    if not args:
+        return {"error": "usage", "detail": "faray-airdrop add <name> [--chain ETH] [--wallet 0x...] [--deadline YYYY-MM-DD] [--requirements text] [--status pending] [--url url] [--notes text]"}
+
+    name = args[0]
+    opts = parse_args(args[1:])
+
+    chain = opts.get("chain", "ETH").upper()
+    if chain not in VALID_CHAINS:
+        return {"error": "invalid chain", "valid": VALID_CHAINS}
+
+    wallet = opts.get("wallet", DEFAULT_WALLET)
+    deadline = opts.get("deadline")
+    requirements = opts.get("requirements", "")
+    status = opts.get("status", "pending")
+    url = opts.get("url", "")
+    notes = opts.get("notes", "")
+
+    if status not in VALID_STATUSES:
+        return {"error": "invalid status", "valid": VALID_STATUSES}
+
+    if deadline:
+        try:
+            datetime.strptime(deadline, "%Y-%m-%d")
+        except ValueError:
+            return {"error": "invalid deadline format", "detail": "Use YYYY-MM-DD"}
+
+    conn = get_db()
+    cur = conn.execute(
+        """INSERT INTO campaigns (name, chain, wallet, deadline, requirements, status, url, notes)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (name, chain, wallet, deadline, requirements, status, url, notes)
+    )
+    conn.commit()
+    campaign_id = cur.lastrowid
+    conn.close()
+
+    return {"ok": True, "id": campaign_id, "name": name, "chain": chain, "status": status}
+
+
+def cmd_list(args):
+    status_filter = args[0] if args else None
+    conn = get_db()
+
+    if status_filter:
+        rows = conn.execute(
+            "SELECT * FROM campaigns WHERE status = ? ORDER BY deadline ASC NULLS LAST, created_at DESC",
+            (status_filter,)
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM campaigns ORDER BY deadline ASC NULLS LAST, created_at DESC"
+        ).fetchall()
+
+    conn.close()
+
+    campaigns = []
+    for r in rows:
+        d = dict(r)
+        if d.get("deadline"):
+            try:
+                dl = datetime.strptime(d["deadline"], "%Y-%m-%d")
+                days_left = (dl - datetime.now()).days
+                d["days_left"] = days_left
+                d["urgent"] = days_left <= 7 and days_left >= 0
+                d["expired"] = days_left < 0
+            except:
+                d["days_left"] = None
+                d["urgent"] = False
+                d["expired"] = False
+        campaigns.append(d)
+
+    return {"count": len(campaigns), "filter": status_filter, "campaigns": campaigns}
+
+
+def cmd_show(args):
+    if not args:
+        return {"error": "usage", "detail": "faray-airdrop show <id>"}
+
+    try:
+        cid = int(args[0])
+    except ValueError:
+        return {"error": "invalid id", "detail": "ID must be a number"}
+
+    conn = get_db()
+    row = conn.execute("SELECT * FROM campaigns WHERE id = ?", (cid,)).fetchone()
+    conn.close()
+
+    if not row:
+        return {"error": "not found", "id": cid}
+
+    d = dict(row)
+    if d.get("deadline"):
+        try:
+            dl = datetime.strptime(d["deadline"], "%Y-%m-%d")
+            d["days_left"] = (dl - datetime.now()).days
+        except:
+            d["days_left"] = None
+
+    return d
+
+
+def cmd_update(args):
+    if len(args) < 3:
+        return {"error": "usage", "detail": "faray-airdrop update <id> --<field> <value>"}
+
+    try:
+        cid = int(args[0])
+    except ValueError:
+        return {"error": "invalid id"}
+
+    opts = parse_args(args[1:])
+    if not opts:
+        return {"error": "no fields to update", "detail": "Use --field value syntax"}
+
+    allowed = {"name", "chain", "wallet", "deadline", "requirements", "status", "url", "notes"}
+    updates = {}
+    for k, v in opts.items():
+        if k not in allowed:
+            return {"error": f"unknown field: {k}", "valid": sorted(allowed)}
+        if k == "status" and v not in VALID_STATUSES:
+            return {"error": f"invalid status: {v}", "valid": VALID_STATUSES}
+        if k == "chain":
+            v = v.upper()
+            if v not in VALID_CHAINS:
+                return {"error": f"invalid chain: {v}", "valid": VALID_CHAINS}
+        if k == "deadline" and v:
+            try:
+                datetime.strptime(v, "%Y-%m-%d")
+            except ValueError:
+                return {"error": "invalid deadline format", "detail": "Use YYYY-MM-DD"}
+        updates[k] = v
+
+    conn = get_db()
+    row = conn.execute("SELECT id FROM campaigns WHERE id = ?", (cid,)).fetchone()
+    if not row:
+        conn.close()
+        return {"error": "not found", "id": cid}
+
+    set_clause = ", ".join(f"{k} = ?" for k in updates)
+    values = list(updates.values()) + [datetime.now().isoformat(), cid]
+    conn.execute(f"UPDATE campaigns SET {set_clause}, updated_at = ? WHERE id = ?", values)
+    conn.commit()
+    conn.close()
+
+    return {"ok": True, "id": cid, "updated": list(updates.keys())}
+
+
+def cmd_delete(args):
+    if not args:
+        return {"error": "usage", "detail": "faray-airdrop delete <id>"}
+
+    try:
+        cid = int(args[0])
+    except ValueError:
+        return {"error": "invalid id"}
+
+    conn = get_db()
+    row = conn.execute("SELECT name FROM campaigns WHERE id = ?", (cid,)).fetchone()
+    if not row:
+        conn.close()
+        return {"error": "not found", "id": cid}
+
+    name = row["name"]
+    conn.execute("DELETE FROM campaigns WHERE id = ?", (cid,))
+    conn.commit()
+    conn.close()
+
+    return {"ok": True, "deleted": cid, "name": name}
+
+
+def cmd_stats(_args):
+    conn = get_db()
+    total = conn.execute("SELECT COUNT(*) as c FROM campaigns").fetchone()["c"]
+    by_status = {}
+    for row in conn.execute("SELECT status, COUNT(*) as c FROM campaigns GROUP BY status"):
+        by_status[row["status"]] = row["c"]
+    by_chain = {}
+    for row in conn.execute("SELECT chain, COUNT(*) as c FROM campaigns GROUP BY chain"):
+        by_chain[row["chain"]] = row["c"]
+
+    # Deadlines within 7 days
+    now = datetime.now()
+    week = (now + timedelta(days=7)).strftime("%Y-%m-%d")
+    today = now.strftime("%Y-%m-%d")
+    upcoming = conn.execute(
+        "SELECT COUNT(*) as c FROM campaigns WHERE deadline IS NOT NULL AND deadline >= ? AND deadline <= ? AND status != 'verified'",
+        (today, week)
+    ).fetchone()["c"]
+
+    # Expired
+    expired = conn.execute(
+        "SELECT COUNT(*) as c FROM campaigns WHERE deadline IS NOT NULL AND deadline < ? AND status NOT IN ('verified', 'expired')",
+        (today,)
+    ).fetchone()["c"]
+
+    conn.close()
+
+    return {
+        "total": total,
+        "by_status": by_status,
+        "by_chain": by_chain,
+        "upcoming_deadline_7d": upcoming,
+        "expired_unclaimed": expired
+    }
+
+
+def cmd_export(_args):
+    conn = get_db()
+    rows = conn.execute("SELECT * FROM campaigns ORDER BY id").fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def cmd_check_deadlines(_args):
+    conn = get_db()
+    now = datetime.now()
+    week = (now + timedelta(days=7)).strftime("%Y-%m-%d")
+    today = now.strftime("%Y-%m-%d")
+
+    rows = conn.execute(
+        """SELECT * FROM campaigns 
+           WHERE deadline IS NOT NULL AND deadline >= ? AND deadline <= ? 
+           AND status NOT IN ('verified', 'expired', 'failed')
+           ORDER BY deadline ASC""",
+        (today, week)
+    ).fetchall()
+    conn.close()
+
+    campaigns = []
+    for r in rows:
+        d = dict(r)
+        dl = datetime.strptime(d["deadline"], "%Y-%m-%d")
+        d["days_left"] = (dl - now).days
+        campaigns.append(d)
+
+    # Also check expired
+    expired_rows = conn.execute(
+        """SELECT * FROM campaigns 
+           WHERE deadline IS NOT NULL AND deadline < ?
+           AND status NOT IN ('verified', 'expired', 'failed')
+           ORDER BY deadline ASC""",
+        (today,)
+    ).fetchall() if False else []  # conn already closed
+
+    return {"urgent": len(campaigns), "campaigns": campaigns}
+
+
+COMMANDS = {
+    "add": cmd_add,
+    "list": cmd_list,
+    "show": cmd_show,
+    "update": cmd_update,
+    "delete": cmd_delete,
+    "stats": cmd_stats,
+    "export": cmd_export,
+    "check-deadlines": cmd_check_deadlines,
+}
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help", "help"):
+        print(__doc__)
+        sys.exit(0)
+
+    cmd = sys.argv[1]
+    if cmd not in COMMANDS:
+        print(json.dumps({"error": f"unknown command: {cmd}", "commands": list(COMMANDS.keys())}))
+        sys.exit(1)
+
+    result = COMMANDS[cmd](sys.argv[2:])
+    print(json.dumps(result, indent=2, default=str))
+
+
+if __name__ == "__main__":
+    main()

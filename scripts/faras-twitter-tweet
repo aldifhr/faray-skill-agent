@@ -1,0 +1,490 @@
+#!/usr/bin/env python3
+"""Twitter/X read + management tool using Playwright + saved cookies.
+
+Usage:
+  faras-twitter-tweet read <tweet_id_or_url>        Read single tweet
+  faras-twitter-tweet replies <tweet_id_or_url> [N] Read N replies (default 20)
+  faras-twitter-tweet thread <tweet_id_or_url>      Get full conversation thread
+  faras-twitter-tweet profile <username> [N]        Get N recent tweets from profile (default 20)
+  faras-twitter-tweet delete <tweet_id_or_url>      Delete a tweet (with confirmation)
+  faras-twitter-tweet bookmarks [N]                 Read N bookmarked tweets (default 20)
+  faras-twitter-tweet timeline [N]                  Read home timeline (default 20)
+  faras-twitter-tweet search <query> [N]            Search tweets (default 20)
+"""
+import sys, json, time
+from playwright.sync_api import sync_playwright
+
+COOKIE_PATH = "/root/.agent/credentials/x-cookies.json"
+
+
+def load_cookies():
+    data = json.load(open(COOKIE_PATH))
+    if isinstance(data, dict) and "cookies" in data:
+        raw = data["cookies"]
+    elif isinstance(data, list):
+        raw = {c["name"]: c["value"] for c in data}
+    else:
+        raw = data
+    return [{"name": k, "value": v, "domain": ".x.com", "path": "/"} for k, v in raw.items()]
+
+
+def extract_tweet_id(raw: str) -> str:
+    """Extract tweet ID from URL or return as-is."""
+    if "x.com" in raw or "twitter.com" in raw:
+        parts = raw.rstrip("/").split("?")[0].split("/")
+        # Skip /photo/N, /video/N, /media/N suffixes
+        tweet_id = parts[-1]
+        if tweet_id.isdigit() and len(parts) >= 2 and parts[-2] in ("photo", "video", "media"):
+            tweet_id = parts[-2 - 1]
+        return tweet_id
+    return raw
+
+
+def make_browser():
+    p = sync_playwright().start()
+    browser = p.chromium.launch(headless=True)
+    ctx = browser.new_context()
+    ctx.add_cookies(load_cookies())
+    page = ctx.new_page()
+    return p, browser, ctx, page
+
+
+def check_login(page) -> bool:
+    return bool(page.query_selector('[data-testid="AppTabBar_Profile_Link"]'))
+
+
+def parse_article(art) -> dict:
+    """Extract data from a single tweet article element."""
+    result = {}
+
+    # Author
+    user_block = art.query_selector('div[data-testid="User-Name"]')
+    if user_block:
+        links = user_block.query_selector_all('a[role="link"]')
+        if links and len(links) >= 2:
+            result["author_name"] = links[0].inner_text()
+            result["author_handle"] = links[1].inner_text()
+        elif links:
+            result["author_handle"] = links[0].inner_text()
+
+    # Tweet text
+    text_els = art.query_selector_all('[data-testid="tweetText"]')
+    if text_els:
+        result["text"] = text_els[0].inner_text()
+
+    # Timestamp
+    time_el = art.query_selector('time')
+    result["time"] = time_el.get_attribute("datetime") if time_el else ""
+
+    # Tweet URL / ID
+    try:
+        time_link = art.query_selector('a[href*="/status/"]')
+        if time_link:
+            href = time_link.get_attribute("href") or ""
+            result["url"] = f"https://x.com{href}" if href.startswith("/") else href
+            # Extract tweet ID, skip /photo/N /video/N /media/N /analytics etc
+            id_parts = href.rstrip("/").split("/")
+            tid = id_parts[-1]
+            skip_suffixes = ("photo", "video", "media", "analytics", "likes", "retweets")
+            if tid.isdigit() and len(id_parts) >= 2 and id_parts[-2] in skip_suffixes:
+                tid = id_parts[-2 - 1]
+            elif not tid.isdigit() and len(id_parts) >= 2:
+                # Non-numeric suffix like /analytics — try second-to-last
+                candidate = id_parts[-2]
+                if candidate.isdigit():
+                    tid = candidate
+            result["tweet_id"] = tid
+    except:
+        pass
+
+    # Engagement
+    for key, testid in [("replies", "reply"), ("retweets", "retweet"), ("likes", "like")]:
+        btn = art.query_selector(f'[data-testid="{testid}"]')
+        if not btn and testid == "like":
+            btn = art.query_selector('[data-testid="unlike"]')
+        if btn:
+            result[key] = btn.get_attribute("aria-label") or ""
+
+    # Images
+    images = art.query_selector_all('[data-testid="tweetPhoto"] img')
+    result["image_count"] = len(images)
+    if images:
+        result["image_urls"] = [img.get_attribute("src") for img in images[:4]]
+
+    # Card
+    card = art.query_selector('[data-testid="card.wrapper"]')
+    if card:
+        result["card"] = card.inner_text()[:200]
+
+    return result
+
+
+def find_main_article(page, expected_handle="") -> object:
+    """Find the main tweet article in a conversation view."""
+    articles = page.query_selector_all('article')
+    if not articles:
+        return None
+
+    # Match by author handle from URL
+    if expected_handle:
+        for art in articles:
+            user_block = art.query_selector('div[data-testid="User-Name"]')
+            if user_block:
+                links = user_block.query_selector_all('a[role="link"]')
+                for link in links:
+                    href = (link.get_attribute("href") or "").lower()
+                    if f"/{expected_handle.lower()}" in href:
+                        return art
+
+    # Fallback: last article (main tweet after quoted tweet)
+    return articles[-1] if len(articles) > 1 else articles[0]
+
+
+def scroll_and_collect(page, max_items: int, article_selector='article') -> list:
+    """Scroll page and collect tweet articles until max_items reached."""
+    results = []
+    seen_texts = set()
+    last_height = 0
+    scroll_attempts = 0
+
+    while len(results) < max_items and scroll_attempts < 15:
+        articles = page.query_selector_all(article_selector)
+        for art in articles:
+            if len(results) >= max_items:
+                break
+            data = parse_article(art)
+            text_key = data.get("text", "")[:80] or data.get("tweet_id", "")
+            if text_key and text_key not in seen_texts:
+                seen_texts.add(text_key)
+                results.append(data)
+
+        # Scroll down
+        page.evaluate("window.scrollBy(0, 800)")
+        page.wait_for_timeout(1500)
+        new_height = page.evaluate("document.body.scrollHeight")
+        if new_height == last_height:
+            scroll_attempts += 1
+        else:
+            scroll_attempts = 0
+        last_height = new_height
+
+    return results
+
+
+# ─── COMMANDS ────────────────────────────────────────────────
+
+def cmd_read(args):
+    if not args:
+        return {"error": "usage", "detail": "faras-twitter-tweet read <tweet_id_or_url>"}
+    tweet_id = extract_tweet_id(args[0])
+
+    p, browser, ctx, page = make_browser()
+    try:
+        page.goto(f"https://x.com/i/status/{tweet_id}", timeout=30000)
+        page.wait_for_timeout(5000)
+
+        if not check_login(page):
+            return {"error": "not_logged_in", "detail": "Cookie expired"}
+
+        path_parts = page.url.rstrip("/").split("/")
+        expected_handle = ""
+        for i, part in enumerate(path_parts):
+            if part == "status" and i > 0:
+                expected_handle = path_parts[i - 1].lower().lstrip("@")
+
+        articles = page.query_selector_all('article')
+        main_article = find_main_article(page, expected_handle)
+
+        result = {"tweet_id": tweet_id, "url": page.url}
+        if main_article:
+            result.update(parse_article(main_article))
+
+        # Quoted tweet: find the OTHER article (not main)
+        # Skip if same author or same text (photo view renders duplicates)
+        main_text = result.get("text", "")[:60]
+        main_author = result.get("author_handle", "")
+        for art in articles:
+            if art != main_article:
+                qt = art.query_selector('[data-testid="tweetText"]')
+                if qt:
+                    qt_text = qt.inner_text()[:60]
+                    # Skip duplicates
+                    if qt_text == main_text:
+                        continue
+                    ub = art.query_selector('div[data-testid="User-Name"]')
+                    qhandle = ""
+                    if ub:
+                        ql = ub.query_selector_all('a[role="link"]')
+                        qhandle = ql[1].inner_text() if len(ql) >= 2 else ""
+                    # Skip if same author (not a quote, just duplicate rendering)
+                    if qhandle and qhandle == main_author:
+                        continue
+                    result["quoted_tweet"] = {"author": qhandle, "text": qt.inner_text()[:300]}
+                break
+
+        return result
+    finally:
+        browser.close()
+        p.stop()
+
+
+def cmd_replies(args):
+    if not args:
+        return {"error": "usage", "detail": "faras-twitter-tweet replies <tweet_id_or_url> [count]"}
+    tweet_id = extract_tweet_id(args[0])
+    count = int(args[1]) if len(args) > 1 else 20
+
+    p, browser, ctx, page = make_browser()
+    try:
+        page.goto(f"https://x.com/i/status/{tweet_id}", timeout=30000)
+        page.wait_for_timeout(5000)
+
+        if not check_login(page):
+            return {"error": "not_logged_in", "detail": "Cookie expired"}
+
+        replies = scroll_and_collect(page, count)
+        # Filter out the main tweet itself (first article)
+        if replies and replies[0].get("tweet_id") == tweet_id:
+            replies = replies[1:]
+
+        return {"tweet_id": tweet_id, "reply_count": len(replies), "replies": replies[:count]}
+    finally:
+        browser.close()
+        p.stop()
+
+
+def cmd_thread(args):
+    if not args:
+        return {"error": "usage", "detail": "faras-twitter-tweet thread <tweet_id_or_url>"}
+    tweet_id = extract_tweet_id(args[0])
+
+    p, browser, ctx, page = make_browser()
+    try:
+        page.goto(f"https://x.com/i/status/{tweet_id}", timeout=30000)
+        page.wait_for_timeout(5000)
+
+        if not check_login(page):
+            return {"error": "not_logged_in", "detail": "Cookie expired"}
+
+        # Get main tweet
+        path_parts = page.url.rstrip("/").split("/")
+        expected_handle = ""
+        for i, part in enumerate(path_parts):
+            if part == "status" and i > 0:
+                expected_handle = path_parts[i - 1].lower().lstrip("@")
+
+        articles = page.query_selector_all('article')
+        main_article = find_main_article(page, expected_handle)
+
+        result = {"tweet_id": tweet_id, "url": page.url}
+        if main_article:
+            result.update(parse_article(main_article))
+
+        # Get ALL replies in thread
+        all_articles = [a for a in articles if a != main_article]
+        replies = []
+        for art in all_articles:
+            data = parse_article(art)
+            if data.get("text"):
+                replies.append(data)
+
+        result["thread_replies"] = replies
+        result["thread_length"] = len(replies) + 1
+
+        # Scroll for more if needed
+        if len(replies) < 10:
+            page.evaluate("window.scrollBy(0, 1500)")
+            page.wait_for_timeout(2000)
+            more = page.query_selector_all('article')
+            seen = {r.get("text", "")[:60] for r in replies}
+            if main_article:
+                seen.add(parse_article(main_article).get("text", "")[:60])
+            for art in more:
+                data = parse_article(art)
+                t = data.get("text", "")[:60]
+                if t and t not in seen:
+                    seen.add(t)
+                    replies.append(data)
+            result["thread_replies"] = replies
+            result["thread_length"] = len(replies) + 1
+
+        return result
+    finally:
+        browser.close()
+        p.stop()
+
+
+def cmd_profile(args):
+    if not args:
+        return {"error": "usage", "detail": "faras-twitter-tweet profile <username> [count]"}
+    username = args[0].lstrip("@")
+    count = int(args[1]) if len(args) > 1 else 20
+
+    p, browser, ctx, page = make_browser()
+    try:
+        page.goto(f"https://x.com/{username}", timeout=30000)
+        page.wait_for_timeout(5000)
+
+        if not check_login(page):
+            return {"error": "not_logged_in", "detail": "Cookie expired"}
+
+        # Get profile info
+        profile = {"username": username, "url": page.url}
+        try:
+            name_el = page.query_selector('div[data-testid="UserName"]')
+            if name_el:
+                profile["display_name"] = name_el.inner_text().split("\n")[0]
+        except:
+            pass
+
+        tweets = scroll_and_collect(page, count)
+
+        profile["tweet_count"] = len(tweets)
+        profile["tweets"] = tweets
+        return profile
+    finally:
+        browser.close()
+        p.stop()
+
+
+def cmd_delete(args):
+    if not args:
+        return {"error": "usage", "detail": "faras-twitter-tweet delete <tweet_id_or_url>"}
+    tweet_id = extract_tweet_id(args[0])
+
+    p, browser, ctx, page = make_browser()
+    try:
+        page.goto(f"https://x.com/i/status/{tweet_id}", timeout=30000)
+        page.wait_for_timeout(4000)
+
+        if not check_login(page):
+            return {"error": "not_logged_in", "detail": "Cookie expired"}
+
+        # Find the main tweet's article
+        path_parts = page.url.rstrip("/").split("/")
+        expected_handle = ""
+        for i, part in enumerate(path_parts):
+            if part == "status" and i > 0:
+                expected_handle = path_parts[i - 1].lower().lstrip("@")
+
+        article = find_main_article(page, expected_handle)
+        if not article:
+            return {"error": "not_found", "detail": "Tweet article not found on page"}
+
+        # Click caret menu
+        caret = article.query_selector('[data-testid="caret"]')
+        if not caret:
+            return {"error": "no_caret", "detail": "Delete option not available (might not be your tweet)"}
+        caret.click()
+        page.wait_for_timeout(1000)
+
+        # Find "Delete" menu item
+        delete_item = page.query_selector('[data-testid="Dropdown"] [role="menuitem"]')
+        menu_items = page.query_selector_all('[data-testid="Dropdown"] [role="menuitem"]')
+        delete_clicked = False
+        for item in menu_items:
+            text = item.inner_text().lower()
+            if "delete" in text:
+                item.click()
+                delete_clicked = True
+                break
+
+        if not delete_clicked:
+            # Try pressing Escape to close menu
+            page.keyboard.press("Escape")
+            return {"error": "no_delete_option", "detail": "Delete menu item not found"}
+
+        page.wait_for_timeout(1000)
+
+        # Confirm delete
+        confirm = page.query_selector('[data-testid="confirmationSheetConfirm"]')
+        if confirm:
+            confirm.click()
+            page.wait_for_timeout(3000)
+            return {"status": "deleted", "tweet_id": tweet_id}
+        else:
+            return {"error": "no_confirm", "detail": "Delete confirmation dialog not found"}
+    finally:
+        browser.close()
+        p.stop()
+
+
+def cmd_bookmarks(args):
+    count = int(args[0]) if args else 20
+
+    p, browser, ctx, page = make_browser()
+    try:
+        page.goto("https://x.com/i/bookmarks", timeout=30000)
+        page.wait_for_timeout(5000)
+
+        if not check_login(page):
+            return {"error": "not_logged_in", "detail": "Cookie expired"}
+
+        tweets = scroll_and_collect(page, count)
+        return {"bookmark_count": len(tweets), "bookmarks": tweets}
+    finally:
+        browser.close()
+        p.stop()
+
+
+def cmd_timeline(args):
+    count = int(args[0]) if args else 20
+
+    p, browser, ctx, page = make_browser()
+    try:
+        page.goto("https://x.com/home", timeout=30000)
+        page.wait_for_timeout(5000)
+
+        if not check_login(page):
+            return {"error": "not_logged_in", "detail": "Cookie expired"}
+
+        tweets = scroll_and_collect(page, count)
+        return {"timeline_count": len(tweets), "timeline": tweets}
+    finally:
+        browser.close()
+        p.stop()
+
+
+def cmd_search(args):
+    if not args:
+        return {"error": "usage", "detail": "faras-twitter-tweet search <query> [count]"}
+    query = args[0]
+    count = int(args[1]) if len(args) > 1 else 20
+
+    p, browser, ctx, page = make_browser()
+    try:
+        page.goto(f"https://x.com/search?q={query}&src=typed_query&f=live", timeout=30000)
+        page.wait_for_timeout(5000)
+
+        if not check_login(page):
+            return {"error": "not_logged_in", "detail": "Cookie expired"}
+
+        tweets = scroll_and_collect(page, count)
+        return {"query": query, "result_count": len(tweets), "results": tweets}
+    finally:
+        browser.close()
+        p.stop()
+
+
+# ─── DISPATCH ────────────────────────────────────────────────
+
+COMMANDS = {
+    "read": cmd_read,
+    "replies": cmd_replies,
+    "thread": cmd_thread,
+    "profile": cmd_profile,
+    "delete": cmd_delete,
+    "bookmarks": cmd_bookmarks,
+    "timeline": cmd_timeline,
+    "search": cmd_search,
+}
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
+        print(json.dumps({"error": "usage", "commands": list(COMMANDS.keys()), "help": __doc__}))
+        sys.exit(1)
+
+    cmd = sys.argv[1]
+    args = sys.argv[2:]
+    result = COMMANDS[cmd](args)
+    print(json.dumps(result, ensure_ascii=False, indent=2))

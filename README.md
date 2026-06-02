@@ -6,14 +6,14 @@ Twitter/X automation toolkit — cookie-based Playwright automation.
 
 | Command | Description |
 |---------|-------------|
-| `faras-twitter-tweet read <id>` | Read single tweet |
-| `faras-twitter-tweet replies <id> [N]` | Read N replies |
-| `faras-twitter-tweet thread <id>` | Get full thread |
-| `faras-twitter-tweet profile <user> [N]` | Scrape N tweets from profile |
-| `faras-twitter-tweet delete <id>` | Delete a tweet |
-| `faras-twitter-tweet bookmarks [N]` | Read bookmarked tweets |
-| `faras-twitter-tweet timeline [N]` | Read home timeline |
-| `faras-twitter-tweet search <query> [N]` | Search tweets |
+| `faray-twitter-tweet read <id>` | Read single tweet |
+| `faray-twitter-tweet replies <id> [N]` | Read N replies |
+| `faray-twitter-tweet thread <id>` | Get full thread |
+| `faray-twitter-tweet profile <user> [N]` | Scrape N tweets from profile |
+| `faray-twitter-tweet delete <id>` | Delete a tweet |
+| `faray-twitter-tweet bookmarks [N]` | Read bookmarked tweets |
+| `faray-twitter-tweet timeline [N]` | Read home timeline |
+| `faray-twitter-tweet search <query> [N]` | Search tweets |
 
 All output JSON.
 
@@ -31,8 +31,8 @@ Minimum cookies: `auth_token` + `ct0`.
 ## Install
 
 ```bash
-cp scripts/faras-twitter-tweet /usr/local/bin/
-chmod +x /usr/local/bin/faras-twitter-tweet
+cp scripts/faray-twitter-tweet /usr/local/bin/
+chmod +x /usr/local/bin/faray-twitter-tweet
 ```
 
 ## License

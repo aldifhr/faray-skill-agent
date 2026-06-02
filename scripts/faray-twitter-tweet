@@ -2,14 +2,14 @@
 """Twitter/X read + management tool using Playwright + saved cookies.
 
 Usage:
-  faras-twitter-tweet read <tweet_id_or_url>        Read single tweet
-  faras-twitter-tweet replies <tweet_id_or_url> [N] Read N replies (default 20)
-  faras-twitter-tweet thread <tweet_id_or_url>      Get full conversation thread
-  faras-twitter-tweet profile <username> [N]        Get N recent tweets from profile (default 20)
-  faras-twitter-tweet delete <tweet_id_or_url>      Delete a tweet (with confirmation)
-  faras-twitter-tweet bookmarks [N]                 Read N bookmarked tweets (default 20)
-  faras-twitter-tweet timeline [N]                  Read home timeline (default 20)
-  faras-twitter-tweet search <query> [N]            Search tweets (default 20)
+  faray-twitter-tweet read <tweet_id_or_url>        Read single tweet
+  faray-twitter-tweet replies <tweet_id_or_url> [N] Read N replies (default 20)
+  faray-twitter-tweet thread <tweet_id_or_url>      Get full conversation thread
+  faray-twitter-tweet profile <username> [N]        Get N recent tweets from profile (default 20)
+  faray-twitter-tweet delete <tweet_id_or_url>      Delete a tweet (with confirmation)
+  faray-twitter-tweet bookmarks [N]                 Read N bookmarked tweets (default 20)
+  faray-twitter-tweet timeline [N]                  Read home timeline (default 20)
+  faray-twitter-tweet search <query> [N]            Search tweets (default 20)
 """
 import sys, json, time
 from playwright.sync_api import sync_playwright
@@ -175,7 +175,7 @@ def scroll_and_collect(page, max_items: int, article_selector='article') -> list
 
 def cmd_read(args):
     if not args:
-        return {"error": "usage", "detail": "faras-twitter-tweet read <tweet_id_or_url>"}
+        return {"error": "usage", "detail": "faray-twitter-tweet read <tweet_id_or_url>"}
     tweet_id = extract_tweet_id(args[0])
 
     p, browser, ctx, page = make_browser()
@@ -230,7 +230,7 @@ def cmd_read(args):
 
 def cmd_replies(args):
     if not args:
-        return {"error": "usage", "detail": "faras-twitter-tweet replies <tweet_id_or_url> [count]"}
+        return {"error": "usage", "detail": "faray-twitter-tweet replies <tweet_id_or_url> [count]"}
     tweet_id = extract_tweet_id(args[0])
     count = int(args[1]) if len(args) > 1 else 20
 
@@ -255,7 +255,7 @@ def cmd_replies(args):
 
 def cmd_thread(args):
     if not args:
-        return {"error": "usage", "detail": "faras-twitter-tweet thread <tweet_id_or_url>"}
+        return {"error": "usage", "detail": "faray-twitter-tweet thread <tweet_id_or_url>"}
     tweet_id = extract_tweet_id(args[0])
 
     p, browser, ctx, page = make_browser()
@@ -316,7 +316,7 @@ def cmd_thread(args):
 
 def cmd_profile(args):
     if not args:
-        return {"error": "usage", "detail": "faras-twitter-tweet profile <username> [count]"}
+        return {"error": "usage", "detail": "faray-twitter-tweet profile <username> [count]"}
     username = args[0].lstrip("@")
     count = int(args[1]) if len(args) > 1 else 20
 
@@ -349,7 +349,7 @@ def cmd_profile(args):
 
 def cmd_delete(args):
     if not args:
-        return {"error": "usage", "detail": "faras-twitter-tweet delete <tweet_id_or_url>"}
+        return {"error": "usage", "detail": "faray-twitter-tweet delete <tweet_id_or_url>"}
     tweet_id = extract_tweet_id(args[0])
 
     p, browser, ctx, page = make_browser()
@@ -447,7 +447,7 @@ def cmd_timeline(args):
 
 def cmd_search(args):
     if not args:
-        return {"error": "usage", "detail": "faras-twitter-tweet search <query> [count]"}
+        return {"error": "usage", "detail": "faray-twitter-tweet search <query> [count]"}
     query = args[0]
     count = int(args[1]) if len(args) > 1 else 20
 

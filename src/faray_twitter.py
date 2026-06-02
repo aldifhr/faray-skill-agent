@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 """
 Faras Twitter CLI — cookie-based Twitter/X client (Playwright backend)
-Usage: faras-twitter <command> [args]
+Usage: faray-twitter <command> [args]
 
 Commands:
   whoami                        Show authenticated user info
